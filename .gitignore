@@ -8,9 +8,10 @@ __pycache__/
 venv/
 ENV/
 
-# IDE
+# IDE / 本地 Agent 配置
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 
