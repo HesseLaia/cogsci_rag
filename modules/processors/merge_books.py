@@ -6,9 +6,9 @@
 import json
 from pathlib import Path
 
-PAPERS_JSON = "papers/all_papers_fulltext.json"
-BOOKS_JSON = "papers/books_processed.json"
-OUTPUT_JSON = "papers/all_papers_fulltext.json"  # 覆盖原文件（会备份）
+PAPERS_JSON = "data/all_papers_fulltext.json"
+BOOKS_JSON = "data/books_processed.json"
+OUTPUT_JSON = "data/all_papers_fulltext.json"  # 覆盖原文件（会备份）
 
 
 def merge_datasets():

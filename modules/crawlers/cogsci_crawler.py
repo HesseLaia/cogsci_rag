@@ -16,7 +16,7 @@ from datetime import datetime
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-OUTPUT_DIR = "papers"
+OUTPUT_DIR = "data"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ── 自动重试的 requests session ──────────────────────────────────

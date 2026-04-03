@@ -41,25 +41,38 @@ python cogsci_rag.py
 
 ```
 cogsci_llm/
-├── app.py                  # Streamlit Web界面
-├── cogsci_rag.py          # RAG核心逻辑（检索+生成）
+├── app.py                      # Streamlit Web界面
+├── cogsci_rag.py               # RAG核心逻辑（检索+生成）
+├── env.example / .env          # 环境变量配置
 │
-├── paper_crawler.py       # 论文爬虫统一入口
-├── cogsci_crawler.py      # 论文元数据爬虫
-├── spider.py              # 全文PDF爬虫
-├── enrich_papers.py       # 核心论文补充
+├── modules/                    # 模块化代码
+│   ├── config/
+│   │   └── book_targets.py     # 书籍清单配置
+│   ├── crawlers/               # 数据爬取
+│   │   ├── paper_crawler.py    # 论文爬虫统一入口
+│   │   ├── cogsci_crawler.py   # 论文元数据爬虫
+│   │   ├── spider.py           # 全文PDF爬虫
+│   │   ├── book_crawler.py     # 书籍爬虫
+│   │   └── enrich_papers.py    # 核心论文补充
+│   └── processors/             # 数据处理
+│       ├── book_processor_enhanced.py  # 书籍章节处理
+│       └── merge_books.py      # 数据合并
 │
-├── book_targets.py        # 书籍清单配置
-├── book_crawler.py        # 书籍爬虫
-├── book_processor.py      # 书籍章节处理
-├── merge_books.py         # 数据合并
+├── data/                       # 数据目录
+│   ├── all_papers_fulltext.json        # 主数据集
+│   ├── books_processed.json            # 书籍数据
+│   ├── books_cache/                    # 书籍PDF缓存
+│   ├── pdfs_cache/                     # 论文PDF缓存
+│   └── archives/                       # 归档(备份/中间文件)
+│       ├── backups/
+│       ├── intermediate/
+│       └── tracks/
 │
-├── papers/                # 数据目录
-│   ├── all_papers_fulltext.json    # 主数据集
-│   ├── books_cache/                # 书籍PDF缓存
-│   └── pdfs_cache/                 # 论文PDF缓存
-│
-└── chroma_db/             # 向量数据库
+├── chroma_db/                  # 向量数据库
+└── docs/                       # 文档
+    ├── ROADMAP.md              # 优化路线图
+    ├── REFACTOR_PLAN.md        # 重构计划
+    └── manual_books_guide.md   # 书籍手册
 ```
 
 ## 🔧 数据处理流程
@@ -68,25 +81,25 @@ cogsci_llm/
 
 ```bash
 # 方式1：统一入口（推荐）
-python paper_crawler.py --mode all
+python -m modules.crawlers.paper_crawler --mode all
 
 # 方式2：分步执行
-python paper_crawler.py --mode metadata    # 1. 爬取元数据
-python paper_crawler.py --mode fulltext    # 2. 获取全文PDF
-python paper_crawler.py --mode enrich      # 3. 补充核心论文
+python -m modules.crawlers.paper_crawler --mode metadata    # 1. 爬取元数据
+python -m modules.crawlers.paper_crawler --mode fulltext    # 2. 获取全文PDF
+python -m modules.crawlers.paper_crawler --mode enrich      # 3. 补充核心论文
 ```
 
 ### 书籍数据
 
 ```bash
 # 第1步：爬取书籍PDF
-python book_crawler.py
+python -m modules.crawlers.book_crawler
 
 # 第2步：处理PDF并提取章节
-python book_processor.py
+python -m modules.processors.book_processor_enhanced
 
 # 第3步：合并到主数据集
-python merge_books.py
+python -m modules.processors.merge_books
 
 # 第4步：重建向量库
 # 删除 chroma_db 目录，重启 app.py 会自动重建
@@ -215,7 +228,8 @@ proxies = {
 
 ### 向量库损坏
 ```bash
-rm -rf chroma_db/
+# Windows PowerShell
+Remove-Item -Recurse -Force chroma_db
 streamlit run app.py  # 自动重建
 ```
 
@@ -228,7 +242,7 @@ open(file, encoding='utf-8')
 ### PDF下载失败
 - 检查网络连接
 - 配置代理
-- 查看 `papers/books_cache/crawl_results.json` 日志
+- 查看 `data/books_cache/crawl_results.json` 日志
 
 ## 📝 许可
 

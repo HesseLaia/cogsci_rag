@@ -31,8 +31,8 @@ from book_targets import CORE_BOOKS, EXTRACTION_STRATEGIES, build_book_metadata
 
 
 # ── 配置 ──────────────────────────────────────────────────────
-BOOKS_DIR = Path("papers/books_cache")
-OUTPUT_JSON = "papers/books_processed.json"
+BOOKS_DIR = Path("data/books_cache")
+OUTPUT_JSON = "data/books_processed.json"
 
 MAX_CHUNK_SIZE = 2000
 OVERLAP = 200

@@ -30,7 +30,7 @@ CORE_PAPERS_SS = [
     },  # Friston 2010 - The Free-Energy Principle
 ]
 
-# ── 需要你手动放PDF进来的论文（放在 papers/pdfs/ 目录下）──────────
+# ── 需要你手动放PDF进来的论文（放在 data/pdfs/ 目录下）──────────
 # 格式：文件名，track，作者年份备注
 PDF_PAPERS = [
     ("nagel_1974_what_is_it_like_to_be_a_bat.pdf", "philosophy"),
@@ -93,7 +93,7 @@ def extract_pdf_abstract(pdf_path):
         return ""
 
 # ── 主流程 ──────────────────────────────────────────────────────
-with open("papers/all_papers_clean.json", "r", encoding="utf-8") as f:
+with open("data/all_papers_clean.json", "r", encoding="utf-8") as f:
     papers = json.load(f)
 
 existing_titles = {p["title"].lower() for p in papers}
@@ -125,7 +125,7 @@ for item in CORE_PAPERS_SS:
 # 第二批：本地PDF
 if PDF_PAPERS:
     print("\n── 处理本地PDF ──")
-    pdf_dir = Path("papers/pdfs")
+    pdf_dir = Path("data/pdfs")
     for filename, track in PDF_PAPERS:
         pdf_path = pdf_dir / filename
         if not pdf_path.exists():
@@ -149,7 +149,7 @@ if PDF_PAPERS:
         print(f"✓  {title[:55]}（PDF，{len(abstract)}字）")
 
 # ── 保存并报告 ───────────────────────────────────────────────────
-with open("papers/all_papers_clean.json", "w", encoding="utf-8") as f:
+with open("data/all_papers_clean.json", "w", encoding="utf-8") as f:
     json.dump(papers, f, ensure_ascii=False, indent=2)
 
 print(f"\n── 完成 ──")

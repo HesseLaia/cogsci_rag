@@ -60,8 +60,8 @@ def run_enrich():
     print("模块: enrich_papers.py")
 
     # 检查输入文件
-    if not Path("papers/all_papers_clean.json").exists():
-        print("✗ 找不到 papers/all_papers_clean.json")
+    if not Path("data/all_papers_clean.json").exists():
+        print("✗ 找不到 data/all_papers_clean.json")
         print("  提示：请先运行 metadata 模式")
         return False
 
@@ -125,7 +125,7 @@ def main():
 
         print("\n" + "=" * 60)
         print("全流程完成！")
-        print("输出文件：papers/all_papers_fulltext.json")
+        print("输出文件：data/all_papers_fulltext.json")
         print("=" * 60)
 
 
