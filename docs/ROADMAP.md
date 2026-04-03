@@ -108,6 +108,8 @@ results_papers = collection.query(
 **轻量级规则分类器（Phase 1）**：
 
 ```python
+import re
+
 def classify_query_intent(query: str) -> dict:
     """
     返回：{
@@ -116,24 +118,53 @@ def classify_query_intent(query: str) -> dict:
         "paper_weight": 0.0-1.0
     }
     """
-    # 概念性关键词
-    concept_keywords = ["是什么", "定义", "机制", "原理", "如何工作", "入门"]
-    
-    # 证据性关键词
-    evidence_keywords = ["研究", "实验", "发现", "证明", "数据", "结果", "哪些论文"]
-    
-    # 前沿性关键词
-    frontier_keywords = ["最新", "近年", "2020", "2025", "前沿", "趋势"]
-    
-    concept_score = sum(1 for kw in concept_keywords if kw in query)
-    evidence_score = sum(1 for kw in evidence_keywords if kw in query)
-    frontier_score = sum(1 for kw in frontier_keywords if kw in query)
-    
-    if concept_score > evidence_score:
+    # 1. 优先级规则：句尾模式直接决定意图
+    if re.search(r'(是什么|定义|怎么理解|如何理解)[\?？]?$', query):
         return {"intent": "concept", "book_weight": 0.7, "paper_weight": 0.3}
-    elif evidence_score > concept_score or frontier_score > 0:
-        return {"intent": "evidence", "book_weight": 0.3, "paper_weight": 0.7}
-    else:
+    
+    if re.search(r'(哪些实验|哪些研究|哪些论文|有什么证据)[\?？]?$', query):
+        return {"intent": "evidence", "book_weight": 0.2, "paper_weight": 0.8}
+    
+    # 2. 加权计分：不同关键词权重不同
+    concept_keywords = {
+        "是什么": 3, "定义": 3, "机制": 2, 
+        "原理": 2, "如何工作": 2, "入门": 3,
+        "概念": 2, "理论": 2
+    }
+    
+    evidence_keywords = {
+        "实验": 2, "研究发现": 3, "研究": 1.5,
+        "数据": 2, "哪些论文": 4, "证明": 2,
+        "结果": 1.5, "发现": 2
+    }
+    
+    frontier_keywords = {
+        "最新": 3, "近年": 2, "2020": 2, 
+        "2025": 2, "前沿": 3, "趋势": 2
+    }
+    
+    # 3. 计算加权分数
+    concept_score = sum(weight for kw, weight in concept_keywords.items() if kw in query)
+    evidence_score = sum(weight for kw, weight in evidence_keywords.items() if kw in query)
+    frontier_score = sum(weight for kw, weight in frontier_keywords.items() if kw in query)
+    
+    # 4. 位置加权：句首的关键词权重×1.5
+    first_10_chars = query[:10]
+    if any(kw in first_10_chars for kw in concept_keywords):
+        concept_score *= 1.5
+    if any(kw in first_10_chars for kw in evidence_keywords):
+        evidence_score *= 1.5
+    
+    # 5. 前沿性强制调整为证据类（需要查最新论文）
+    if frontier_score > 2:
+        evidence_score += frontier_score
+    
+    # 6. 判定意图
+    if concept_score > evidence_score * 1.5:  # 概念明显占优
+        return {"intent": "concept", "book_weight": 0.7, "paper_weight": 0.3}
+    elif evidence_score > concept_score * 1.5:  # 证据明显占优
+        return {"intent": "evidence", "book_weight": 0.2, "paper_weight": 0.8}
+    else:  # 混合型问题
         return {"intent": "mixed", "book_weight": 0.5, "paper_weight": 0.5}
 ```
 
@@ -204,6 +235,46 @@ def hybrid_retrieve(query: str, collection) -> dict:
         where={"source_type": "paper"}
     )
     papers = _filter_papers_by_citation(raw_papers, min_citations=10)[:n_papers]
+    
+    # 4. 【保底策略】如果某类检索结果不足，动态补充
+    book_shortage = n_books - len(books)
+    paper_shortage = n_papers - len(papers)
+    
+    if book_shortage > 0 and intent == "concept":
+        # 概念类问题书籍不足，补充论文
+        extra_papers = collection.query(
+            query_embeddings=q_emb,
+            n_results=(n_papers + book_shortage) * 3,
+            where={"source_type": "paper"}
+        )
+        papers = _filter_papers_by_citation(extra_papers, min_citations=10)[:n_papers + book_shortage]
+        print(f"[保底] 书籍不足，补充{book_shortage}篇论文")
+    
+    if paper_shortage > 0 and intent == "evidence":
+        # 证据类问题论文不足，降低引用数阈值重试
+        extra_papers = collection.query(
+            query_embeddings=q_emb,
+            n_results=n_papers * 3,
+            where={"source_type": "paper"}
+        )
+        papers_low_threshold = _filter_papers_by_citation(extra_papers, min_citations=5)[:n_papers]
+        if len(papers_low_threshold) > len(papers):
+            papers = papers_low_threshold
+            print(f"[保底] 论文不足，降低引用数阈值至5")
+    
+    # 5. 如果混合问题两边都不足，补充总量到最低限
+    total_results = len(books) + len(papers)
+    if total_results < 4:  # 至少保证4个结果
+        print(f"[警告] 检索结果不足({total_results}个)，放宽条件重新检索")
+        # 不区分类型，直接检索top相关的
+        fallback = collection.query(
+            query_embeddings=q_emb,
+            n_results=6
+        )
+        # 合并结果并去重
+        all_results = books + papers + _parse_mixed_results(fallback)
+        books = [r for r in all_results if r.get("source_type") == "book"][:2]
+        papers = [r for r in all_results if r.get("source_type") == "paper"][:3]
     
     return {
         "books": books,
@@ -401,8 +472,25 @@ class SessionMemory:
         return [term for term in cogsci_terms if term in text]
     
     def _summarize(self, response: str) -> str:
-        """简化版：取前100字作为摘要"""
-        return response[:100] + "..." if len(response) > 100 else response
+        """生成摘要：优先用关键句提取，避免截断丢失信息"""
+        if len(response) < 150:
+            return response
+        
+        # 简单但有效的方法：提取第一段和最后一句
+        lines = response.strip().split('\n')
+        non_empty = [l for l in lines if l.strip()]
+        
+        if len(non_empty) <= 2:
+            return response[:100] + "..."
+        
+        # 提取"结论"部分（如果有）
+        for i, line in enumerate(non_empty):
+            if "**结论**" in line or "**展开**" in line:
+                if i + 1 < len(non_empty):
+                    return non_empty[i + 1][:150]
+        
+        # 否则返回首句
+        return non_empty[0][:150] + "..."
 ```
 
 **2.3.2 长期记忆管理**
@@ -630,17 +718,36 @@ def enhanced_retrieve(query: str) -> dict:
 
 ## 📊 效果评估指标
 
-### 检索质量指标
-- **书籍/论文分布稳定性**：统计100个问题的检索结果，计算书籍chunk占比的标准差（应＜0.15）
-- **相关性准确率**：人工标注50个问题的"理想检索结果类型"，与实际检索结果对比（应＞85%）
+### 自动化指标（开发阶段持续监控）
 
-### 对话连贯性指标
-- **追问理解率**：在50个包含指代词的追问中，系统能正确理解上文的比例（应＞90%）
-- **记忆召回率**：用户提到"之前你说的XX"时，系统能找回相关历史的比例（应＞80%）
+#### 检索稳定性
+- **书籍/论文分布一致性**：同一问题连续3次检索，书籍/论文比例波动<10%
+- **响应时间**：P95延迟<2秒（检索<300ms，生成<1.8s）
 
-### 用户体验指标
-- **对话轮次**：平均每个session的对话轮次（期望＞5轮，表明用户愿意深入讨论）
-- **追问比例**：包含"详细"、"那"等追问词的问题占比（期望＞30%，表明对话流畅）
+#### 记忆系统
+- **追问关键词召回**：追问中90%能从历史中找到上文提及的关键词
+- **session_memory文件大小**：<500KB（10轮对话）
+
+### 人工评估（Phase验收时执行）
+
+#### 抽样方案
+- **样本来源**：每个Phase完成后，收集20个真实用户问题（或构造典型问题）
+- **评分维度**（1-5分制）：
+  - 相关性：检索结果是否切题
+  - 连贯性：多轮对话是否流畅
+  - 有用性：回答是否解决了问题
+- **目标**：平均分>4.0
+
+#### Phase 1 验收标准
+- 概念性问题（如"预测编码是什么"）能稳定返回2-3个书籍chunk
+- 证据性问题（如"有哪些实验证明了预测编码"）能稳定返回3-4篇论文
+- 混合问题能合理分配资源
+- **测试用例**：准备10个concept + 10个evidence + 5个mixed问题
+
+#### Phase 2 验收标准
+- 用户问"详细展开一下"时，系统能正确理解上文（10个追问测试，成功率>8/10）
+- 跨会话能记住用户的兴趣偏好
+- 侧边栏能显示当前话题和历史兴趣
 
 ---
 
@@ -658,6 +765,90 @@ def enhanced_retrieve(query: str) -> dict:
 ### 兼容性
 - 新的检索接口需保证向后兼容
 - 现有的`retrieve()`函数可保留，添加新的`hybrid_retrieve()`
+
+---
+
+## ⚠️ 风险评估与缓解方案
+
+### 风险1：向量库重建失败
+
+**概率**：中  
+**影响**：高（系统完全不可用）  
+
+**缓解措施**：
+- 重建前自动备份到 `chroma_db_backup_YYYYMMDD/`
+- 增量测试：先用10条数据测试重建流程
+- 提供一键回滚脚本：
+  ```bash
+  # rollback_vectorstore.ps1
+  Remove-Item -Recurse -Force chroma_db
+  Copy-Item -Recurse chroma_db_backup chroma_db
+  ```
+
+### 风险2：Query分类器误判率过高
+
+**概率**：中  
+**影响**：中（检索结果不理想，但不影响系统运行）
+
+**缓解措施**：
+- 开发阶段记录分类日志：`{"query": "...", "intent": "...", "confidence": 0.8}`
+- 每50个query人工抽查10个，误判率>20%则调整规则
+- 保留fallback机制：分类不确定时使用mixed模式
+
+### 风险3：记忆系统内存/存储泄漏
+
+**概率**：低  
+**影响**：中（长时间运行后变慢或磁盘占满）
+
+**缓解措施**：
+- SessionMemory强制限制：最多10轮，超过则自动丢弃最早的
+- user_memory.json定期清理：30天未活跃的topic归档
+- 监控文件大小：每次save时检查，>10MB则触发警告
+
+### 风险4：Phase 1/2 改动破坏现有功能
+
+**概率**：低  
+**影响**：高（用户无法正常使用）
+
+**缓解措施**：
+- 每个Phase开始前打tag：`git tag before-phase-1`
+- 保留原有函数：`retrieve()`改名为`retrieve_legacy()`，不删除
+- 回归测试清单：
+  ```
+  ✓ 基础问答能否正常返回结果
+  ✓ 向量库加载是否成功
+  ✓ LLM调用是否正常
+  ✓ Streamlit界面是否正常渲染
+  ```
+
+---
+
+## 🔄 回滚策略
+
+### Phase 1 回滚清单
+
+**触发条件**：
+- 重建向量库后检索结果明显变差
+- 分类器误判率>30%
+- 系统崩溃或无法启动
+
+**回滚步骤**：
+1. 代码回滚：`git reset --hard before-phase-1`
+2. 数据回滚：`Copy-Item -Recurse chroma_db_backup chroma_db -Force`
+3. 验证：运行5个测试问题，确认恢复正常
+4. 记录问题：在issue中说明回滚原因和复现步骤
+
+### Phase 2 回滚清单
+
+**触发条件**：
+- 对话记忆功能导致回答错误
+- session_memory文件增长过快（>1MB）
+- 追问功能理解错误率>50%
+
+**回滚步骤**：
+1. 代码回滚：`git reset --hard before-phase-2`
+2. 清理记忆文件：`Remove-Item user_memory.json, session_*.json`
+3. 重启Streamlit：`streamlit run app.py`
 
 ---
 

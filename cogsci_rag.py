@@ -10,6 +10,7 @@ CogSci RAG 问答系统 v3
 
 import json
 import os
+import re
 import chromadb
 import requests
 from sentence_transformers import SentenceTransformer
@@ -261,6 +262,13 @@ def build_or_load_vectorstore(papers):
 
     if COLLECTION in existing:
         col = client.get_collection(COLLECTION)
+        peek = col.get(limit=1, include=["metadatas"])
+        m0 = (peek.get("metadatas") or [None])[0] or {}
+        if not m0.get("source_type"):
+            print(
+                "[警告] 向量库元数据缺少 source_type，混合检索将回退为旧版检索。"
+                "请删除 chroma_db 后重启以重建向量库。"
+            )
         print(f"[OK] 向量库：{col.count()} 条")
         return col
 
@@ -275,6 +283,11 @@ def build_or_load_vectorstore(papers):
         ids.append(str(i))
         content = p.get("fulltext") or p.get("abstract", "")
         texts.append(f"{title}\n\n{content}")
+        src_type = p.get("source_type") or (
+            "book" if p.get("source") == "book" else "paper"
+        )
+        bt = p.get("book_title") or ""
+        ch = p.get("chapter") or ""
         metas.append({
             "title":          title,
             "authors":        ", ".join(p.get("authors", [])),
@@ -283,6 +296,9 @@ def build_or_load_vectorstore(papers):
             "citation_count": str(p.get("citation_count") or "0"),
             "url":            p.get("url", ""),
             "tier":           p.get("tier", ""),
+            "source_type":    src_type,
+            "book_title":     bt,
+            "chapter":        ch,
         })
 
     col = client.create_collection(COLLECTION)
@@ -298,6 +314,100 @@ def build_or_load_vectorstore(papers):
 
     print(f"[OK] 向量库构建完成")
     return col
+
+
+def _meta_passes_citation(meta, min_cite):
+    cite = int(meta.get("citation_count") or 0)
+    tier = meta.get("tier", "")
+    return cite >= min_cite or tier == "recent"
+
+
+def _collection_has_source_type(collection):
+    peek = collection.get(limit=1, include=["metadatas"])
+    m0 = (peek.get("metadatas") or [None])[0] or {}
+    return bool(m0.get("source_type"))
+
+
+def classify_query_intent(query):
+    if re.search(r"(是什么|定义|怎么理解|如何理解)[\?？]?$", query):
+        return {"intent": "concept", "book_weight": 0.7, "paper_weight": 0.3}
+    if re.search(r"(哪些实验|哪些研究|哪些论文|有什么证据)[\?？]?$", query):
+        return {"intent": "evidence", "book_weight": 0.2, "paper_weight": 0.8}
+
+    concept_keywords = {
+        "是什么": 3,
+        "定义": 3,
+        "机制": 2,
+        "原理": 2,
+        "如何工作": 2,
+        "入门": 3,
+        "概念": 2,
+        "理论": 2,
+    }
+    evidence_keywords = {
+        "实验": 2,
+        "研究发现": 3,
+        "研究": 1.5,
+        "数据": 2,
+        "哪些论文": 4,
+        "证明": 2,
+        "结果": 1.5,
+        "发现": 2,
+    }
+    frontier_keywords = {
+        "最新": 3,
+        "近年": 2,
+        "2020": 2,
+        "2025": 2,
+        "前沿": 3,
+        "趋势": 2,
+    }
+
+    concept_score = sum(
+        w for kw, w in concept_keywords.items() if kw in query
+    )
+    evidence_score = sum(
+        w for kw, w in evidence_keywords.items() if kw in query
+    )
+    frontier_score = sum(
+        w for kw, w in frontier_keywords.items() if kw in query
+    )
+
+    first_10 = query[:10]
+    if any(kw in first_10 for kw in concept_keywords):
+        concept_score *= 1.5
+    if any(kw in first_10 for kw in evidence_keywords):
+        evidence_score *= 1.5
+    if frontier_score > 2:
+        evidence_score += frontier_score
+
+    if concept_score > evidence_score * 1.5:
+        return {"intent": "concept", "book_weight": 0.7, "paper_weight": 0.3}
+    if evidence_score > concept_score * 1.5:
+        return {"intent": "evidence", "book_weight": 0.2, "paper_weight": 0.8}
+    return {"intent": "mixed", "book_weight": 0.5, "paper_weight": 0.5}
+
+
+def _doc_from_chroma(meta, document):
+    title = meta.get("title", "")
+    body = document.split("\n\n", 1)[-1] if "\n\n" in document else document
+    snippet = body[:500]
+    cite = int(meta.get("citation_count") or 0)
+    st = meta.get("source_type") or "paper"
+    d = {
+        "title": title,
+        "authors": meta.get("authors", ""),
+        "year": meta.get("year", ""),
+        "track": meta.get("track", ""),
+        "citations": cite,
+        "url": meta.get("url", ""),
+        "abstract": snippet,
+        "source_type": st,
+    }
+    if st == "book":
+        d["book_title"] = meta.get("book_title", "")
+        d["chapter"] = meta.get("chapter", "")
+    return d
 
 
 # ── 检索 ─────────────────────────────────────────────────────────
@@ -317,7 +427,8 @@ def retrieve(query, collection):
         tier = meta.get("tier", "")
         if cite < MIN_CITATIONS and tier != "recent":
             continue
-        docs.append({
+        st = meta.get("source_type") or "paper"
+        doc = {
             "title":    title,
             "authors":  meta.get("authors", ""),
             "year":     meta.get("year", ""),
@@ -325,7 +436,12 @@ def retrieve(query, collection):
             "citations": cite,
             "url":      meta.get("url", ""),
             "abstract": raw["documents"][0][i].split("\n\n", 1)[-1][:500],
-        })
+            "source_type": st,
+        }
+        if st == "book":
+            doc["book_title"] = meta.get("book_title", "")
+            doc["chapter"] = meta.get("chapter", "")
+        docs.append(doc)
         if len(docs) >= TOP_K:
             break
 
@@ -337,7 +453,8 @@ def retrieve(query, collection):
             if title in seen:
                 continue
             seen.add(title)
-            docs.append({
+            st = meta.get("source_type") or "paper"
+            doc = {
                 "title":   title,
                 "authors": meta.get("authors", ""),
                 "year":    meta.get("year", ""),
@@ -345,18 +462,127 @@ def retrieve(query, collection):
                 "citations": int(meta.get("citation_count") or 0),
                 "url":     meta.get("url", ""),
                 "abstract": raw["documents"][0][i].split("\n\n", 1)[-1][:500],
-            })
+                "source_type": st,
+            }
+            if st == "book":
+                doc["book_title"] = meta.get("book_title", "")
+                doc["chapter"] = meta.get("chapter", "")
+            docs.append(doc)
             if len(docs) >= 3:
                 break
     return docs
 
 
+def hybrid_retrieve(query, collection):
+    if not _collection_has_source_type(collection):
+        return retrieve(query, collection)
+
+    embedder = get_embedder()
+    q_emb = embedder.encode([query]).tolist()
+    intent = classify_query_intent(query)["intent"]
+    if intent == "concept":
+        n_books, n_papers = 3, 2
+    elif intent == "evidence":
+        n_books, n_papers = 2, 4
+    else:
+        n_books, n_papers = 2, 3
+
+    def pull_books(raw, cap, seen):
+        out = []
+        for i in range(len(raw["ids"][0])):
+            meta = raw["metadatas"][0][i]
+            title = meta.get("title", "")
+            if title in seen:
+                continue
+            seen.add(title)
+            out.append(_doc_from_chroma(meta, raw["documents"][0][i]))
+            if len(out) >= cap:
+                break
+        return out
+
+    def pull_papers(raw, cap, min_cite, seen):
+        out = []
+        for i in range(len(raw["ids"][0])):
+            meta = raw["metadatas"][0][i]
+            if meta.get("source_type") == "book":
+                continue
+            title = meta.get("title", "")
+            if title in seen:
+                continue
+            if not _meta_passes_citation(meta, min_cite):
+                continue
+            seen.add(title)
+            out.append(_doc_from_chroma(meta, raw["documents"][0][i]))
+            if len(out) >= cap:
+                break
+        return out
+
+    seen = set()
+    raw_books = collection.query(
+        query_embeddings=q_emb,
+        n_results=max(n_books * 2, 6),
+        where={"source_type": "book"},
+    )
+    books = pull_books(raw_books, n_books, seen)
+
+    raw_papers = collection.query(
+        query_embeddings=q_emb,
+        n_results=max(n_papers * 3, 9),
+        where={"source_type": "paper"},
+    )
+    papers = pull_papers(raw_papers, n_papers, MIN_CITATIONS, seen)
+
+    if intent == "concept" and len(books) < n_books:
+        extra = n_books - len(books)
+        raw_p2 = collection.query(
+            query_embeddings=q_emb,
+            n_results=max((n_papers + extra) * 3, 12),
+            where={"source_type": "paper"},
+        )
+        papers = pull_papers(raw_p2, n_papers + extra, MIN_CITATIONS, seen)
+
+    if intent == "evidence" and len(papers) < n_papers:
+        seen_ev = set(b["title"] for b in books)
+        papers = pull_papers(raw_papers, n_papers, 5, seen_ev)
+
+    if len(books) + len(papers) < 4:
+        return retrieve(query, collection)
+
+    return books + papers
+
+
+def _build_library_context(docs):
+    books = [d for d in docs if d.get("source_type") == "book"]
+    papers = [d for d in docs if d.get("source_type") != "book"]
+    if not books:
+        return "\n\n".join([
+            f"[{i+1}] {d['title']} ({d['year']}, 引用:{d['citations']})\n摘要：{d['abstract']}..."
+            for i, d in enumerate(docs)
+        ])
+
+    parts = []
+    idx = 1
+    parts.append("=== 教材知识 ===")
+    for d in books:
+        bt = d.get("book_title") or d["title"]
+        ch = d.get("chapter") or ""
+        head = f"{bt}" + (f" — {ch}" if ch else "")
+        parts.append(
+            f"[{idx}] {head}\n{d['title']}\n摘录：{d['abstract']}..."
+        )
+        idx += 1
+    parts.append("=== 研究论文 ===")
+    for d in papers:
+        parts.append(
+            f"[{idx}] {d['title']} ({d['year']}, 引用:{d['citations']})\n摘要：{d['abstract']}..."
+        )
+        idx += 1
+    return "\n\n".join(parts)
+
+
 # ── OpenRouter生成 ────────────────────────────────────────────────
 def ask_openrouter(question, docs, mode="qa"):
-    context = "\n\n".join([
-        f"[{i+1}] {d['title']} ({d['year']}, 引用:{d['citations']})\n摘要：{d['abstract']}..."
-        for i, d in enumerate(docs)
-    ])
+    context = _build_library_context(docs)
 
     if mode == "intro":
         user_msg  = f"请帮我介绍「{question}」这个认知科学方向。"
@@ -365,7 +591,14 @@ def ask_openrouter(question, docs, mode="qa"):
         user_msg  = f"问题：{question}"
         sys_prompt = active_system_prompt
 
-    full_user = f"=== 知识库论文 ===\n{context}\n\n{user_msg}"
+    hybrid_hint = ""
+    if any(d.get("source_type") == "book" for d in docs):
+        hybrid_hint = (
+            "【知识库说明】下文分「教材知识」与「研究论文」；概念框架可优先依据教材，"
+            "实验与实证可依据论文。引用时请对应序号并写出具体文献做了什么。\n\n"
+        )
+
+    full_user = f"{hybrid_hint}=== 知识库 ===\n{context}\n\n{user_msg}"
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -400,13 +633,19 @@ def ask_openrouter(question, docs, mode="qa"):
 
 # ── 打印来源 ─────────────────────────────────────────────────────
 def print_sources(docs):
-    print("\n─── 检索到的论文 ──────────────────────────────────────")
+    print("\n─── 检索到的来源 ──────────────────────────────────────")
     for i, d in enumerate(docs, 1):
         track_cn = TRACK_NAMES.get(d["track"], d["track"])
-        cite_str = f"  {d['citations']}次引用" if d["citations"] else ""
-        print(f"[{i}] {d['title']}")
+        cite_str = f"  {d['citations']}次引用" if d.get("citations") else ""
+        if d.get("source_type") == "book":
+            bt = d.get("book_title") or d["title"]
+            ch = d.get("chapter") or ""
+            extra = f" · {ch}" if ch else ""
+            print(f"[{i}] [教材] {bt}{extra}")
+        else:
+            print(f"[{i}] {d['title']}")
         print(f"     {d['authors']} · {d['year']} · {track_cn}{cite_str}")
-        if d["url"]:
+        if d.get("url"):
             print(f"     {d['url']}")
     print("────────────────────────────────────────────────────────")
 
@@ -466,7 +705,7 @@ def main():
         elif user_input.startswith("入门 "):
             topic = user_input[3:].strip()
             print(f"\n检索「{topic}」相关论文...")
-            docs = retrieve(topic, collection)
+            docs = hybrid_retrieve(topic, collection)
             print_sources(docs)
             print("\n生成入门指南中...\n")
             print("─── 入门指南 ────────────────────────────────────────")
@@ -475,7 +714,7 @@ def main():
 
         else:
             print("\n检索相关论文...")
-            docs = retrieve(user_input, collection)
+            docs = hybrid_retrieve(user_input, collection)
             print_sources(docs)
             print("\n回答中...\n")
             print("─── 回答 ────────────────────────────────────────────")

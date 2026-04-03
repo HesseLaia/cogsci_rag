@@ -6,7 +6,7 @@ CogSci RAG — Streamlit 界面
 import streamlit as st
 from cogsci_rag import (
     load_papers, build_or_load_vectorstore, get_embedder,
-    retrieve, ask_openrouter, build_user_profile,
+    hybrid_retrieve, ask_openrouter, build_user_profile,
     TRACK_NAMES, USER_PROFILE_QUESTIONS,
     SYSTEM_PROMPT, INTRO_SYSTEM_PROMPT,
 )
@@ -131,12 +131,16 @@ for msg in st.session_state.messages:
         st.markdown(msg["content"])
         # 显示引用来源
         if msg.get("sources"):
-            with st.expander("📄 检索到的论文", expanded=False):
+            with st.expander("📄 检索到的来源", expanded=False):
                 for i, d in enumerate(msg["sources"], 1):
                     track_cn = TRACK_NAMES.get(d["track"], d["track"])
-                    cite_str = f" · {d['citations']}次引用" if d["citations"] else ""
+                    cite_str = f" · {d['citations']}次引用" if d.get("citations") else ""
                     url      = d.get("url", "")
-                    title_md = f"[{d['title']}]({url})" if url else d["title"]
+                    if d.get("source_type") == "book":
+                        bt = d.get("book_title") or d["title"]
+                        title_md = bt
+                    else:
+                        title_md = f"[{d['title']}]({url})" if url else d["title"]
                     st.markdown(
                         f"**[{i}]** {title_md}  \n"
                         f"<small>{d['authors']} · {d['year']} · {track_cn}{cite_str}</small>",
@@ -163,7 +167,7 @@ if user_input:
     # 检索 + 生成
     with st.chat_message("assistant"):
         with st.spinner("检索相关论文..."):
-            docs = retrieve(topic, collection)
+            docs = hybrid_retrieve(topic, collection)
 
         mode = "intro" if is_intro else "qa"
 
@@ -179,12 +183,16 @@ if user_input:
 
         # 来源折叠面板
         if docs:
-            with st.expander("📄 检索到的论文", expanded=False):
+            with st.expander("📄 检索到的来源", expanded=False):
                 for i, d in enumerate(docs, 1):
                     track_cn = TRACK_NAMES.get(d["track"], d["track"])
-                    cite_str = f" · {d['citations']}次引用" if d["citations"] else ""
+                    cite_str = f" · {d['citations']}次引用" if d.get("citations") else ""
                     url      = d.get("url", "")
-                    title_md = f"[{d['title']}]({url})" if url else d["title"]
+                    if d.get("source_type") == "book":
+                        bt = d.get("book_title") or d["title"]
+                        title_md = bt
+                    else:
+                        title_md = f"[{d['title']}]({url})" if url else d["title"]
                     st.markdown(
                         f"**[{i}]** {title_md}  \n"
                         f"<small>{d['authors']} · {d['year']} · {track_cn}{cite_str}</small>",
