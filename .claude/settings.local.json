@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(ls:*)",
+      "Bash(pip list:*)",
+      "Bash(mv \"Articulate Mammal by Jean Aticheson.pdf\" \"linguistics_Psycholinguistics.pdf\")",
+      "Bash(mv \"Consciousness-Explained.pdf\" \"philosophy_Consciousness_Explained.pdf\")",
+      "Bash(mv \"Daniel Kahneman-Thinking, Fast and Slow  .pdf\" \"psychological_science_Thinking_Fast_and_Slow.pdf\")",
+      "Bash(mv \"Memory  from mind to molecules \\(Squire, Larry R, Kandel, Eric R\\) \\(z-library.sk, 1lib.sk, z-lib.sk\\).pdf\" \"psychological_science_Memory_From_Mind_to_Molecules.pdf\")",
+      "Bash(mv \"TheCulturalOriginsofHumanCognition.pdf\" \"social_sciences_Cultural_Origins_of_Human_Cognition.pdf\")",
+      "Bash(xargs -I{} basename {})",
+      "Bash(tee book_processing.log)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Bash(done)",
+      "Bash(tee -a book_processing_full.log)",
+      "Read(//c/Users/86137/projects/cogsci_llm/**)",
+      "Bash(tee big_books_log.txt)"
+    ]
+  }
+}

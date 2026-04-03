@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 数据文件（太大，不提交）
+papers/*.json
+papers/pdfs/
+papers/pdfs_cache/
+papers/books_cache/
+chroma_db/
+
+# 日志
+*.log
+
+# 临时文件
+*.tmp
+*.bak
+*.backup
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# API密钥（安全）
+*_key.txt
+secrets.py
+.env
