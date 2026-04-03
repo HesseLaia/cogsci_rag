@@ -16,10 +16,11 @@ ENV/
 *.swo
 
 # 数据文件（太大，不提交）
-papers/*.json
-papers/pdfs/
-papers/pdfs_cache/
-papers/books_cache/
+data/*.json
+data/pdfs/
+data/pdfs_cache/
+data/books_cache/
+data/archives/
 chroma_db/
 
 # 日志

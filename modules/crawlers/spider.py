@@ -28,9 +28,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Tesseract路径，Windows用户按实际安装位置修改
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
-INPUT_JSON  = "papers/all_papers_fulltext.json"
-OUTPUT_JSON = "papers/all_papers_fulltext.json"
-PDF_DIR     = Path("papers/pdfs_cache")   # PDF临时缓存目录
+INPUT_JSON  = "data/all_papers_fulltext.json"
+OUTPUT_JSON = "data/all_papers_fulltext.json"
+PDF_DIR     = Path("data/pdfs_cache")   # PDF临时缓存目录
 PDF_DIR.mkdir(parents=True, exist_ok=True)
 
 # 综述类关键词，标题或摘要含这些词的优先处理

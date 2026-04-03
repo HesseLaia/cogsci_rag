@@ -18,7 +18,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from book_targets import CORE_BOOKS
 
 # ── 配置 ──────────────────────────────────────────────────────
-BOOKS_DIR = Path("papers/books_cache")
+BOOKS_DIR = Path("data/books_cache")
 BOOKS_DIR.mkdir(parents=True, exist_ok=True)
 
 LIBGEN_SEARCH_API = "http://libgen.rs/json.php"

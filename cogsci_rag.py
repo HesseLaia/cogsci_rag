@@ -15,7 +15,7 @@ import requests
 from sentence_transformers import SentenceTransformer
 
 # ── 配置 ─────────────────────────────────────────────────────────
-PAPERS_PATH = "papers/all_papers_fulltext.json"
+PAPERS_PATH = "data/all_papers_fulltext.json"
 CHROMA_DIR        = "chroma_db"
 COLLECTION        = "cogsci_papers"
 EMBED_MODEL       = "all-MiniLM-L6-v2"
