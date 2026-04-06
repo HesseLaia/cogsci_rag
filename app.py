@@ -288,12 +288,19 @@ if user_input:
             cogsci_rag.active_system_prompt = sys_qa
             cogsci_rag.active_intro_prompt  = sys_intro
 
+            chat_hist = []
+            for msg in st.session_state.messages[:-1]:
+                chat_hist.append({
+                    "role": msg["role"],
+                    "content": msg["content"],
+                })
             with st.spinner("生成回答..."):
                 answer = ask_openrouter(
                     topic,
                     docs,
                     mode=mode,
                     session_memory=st.session_state.session_memory,
+                    chat_history=chat_hist,
                 )
 
             st.markdown(answer)
