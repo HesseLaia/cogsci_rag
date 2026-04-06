@@ -321,9 +321,40 @@ def build_user_profile(answers: dict) -> str:
     return profile
 
 
+def build_system_prompt(questionnaire_profile, cognitive_summary=""):
+    """拼出注入 SYSTEM_PROMPT / INTRO_SYSTEM_PROMPT 的 {user_profile} 全文。"""
+    p = questionnaire_profile or ""
+    cs = (cognitive_summary or "").strip()
+    if not cs:
+        return p
+    p = p + "\n\n【用户近期认知状态】\n" + cs
+    p += (
+        "\n\n【如何使用以上认知状态】\n"
+        "- understanding_level 是 heard_of 的概念：从类比开始，不要直接讲机制\n"
+        "- understanding_level 是 intuitive 的：可以开始引入机制，用 preferred_angle "
+        "对应的领域做桥梁\n"
+        "- understanding_level 是 can_explain 的：直接讨论，可以挑战用户的理解\n"
+        "- stuck_points 里的子问题：主动拆解，不要回避\n"
+        "- 检测到用户在重复问同一个概念（mentions > 3）：说明上次没讲透，"
+        "换一个角度重新解释，不要重复上次的类比"
+    )
+    return p
+
+
 USER_MEMORY_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "user_memory.json"
 )
+
+
+def load_memory():
+    if not os.path.exists(USER_MEMORY_PATH):
+        return {}
+    with open(USER_MEMORY_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    tw = data.get("interests", {}).get("track_weights")
+    if not tw:
+        return {}
+    return tw
 
 
 class SessionMemory:
@@ -873,10 +904,22 @@ def _doc_from_chroma(meta, document):
 
 # ── 检索 ─────────────────────────────────────────────────────────
 def retrieve(query, collection):
+    track_weights = load_memory()
     embedder    = get_embedder()
     q_emb       = embedder.encode([query]).tolist()
     raw         = collection.query(query_embeddings=q_emb, n_results=TOP_K * 3)
-    docs, seen  = [], set()
+    dist_row = raw.get("distances")
+    dists = dist_row[0] if dist_row else None
+
+    def _vec_sim(i):
+        if dists is None or i >= len(dists):
+            return 1.0
+        d0 = dists[i]
+        if d0 is None:
+            return 1.0
+        return 1.0 / (1.0 + float(d0))
+
+    scored, seen = [], set()
 
     for i in range(len(raw["ids"][0])):
         meta  = raw["metadatas"][0][i]
@@ -902,9 +945,13 @@ def retrieve(query, collection):
         if st == "book":
             doc["book_title"] = meta.get("book_title", "")
             doc["chapter"] = meta.get("chapter", "")
-        docs.append(doc)
-        if len(docs) >= TOP_K:
-            break
+        tr = meta.get("track", "") or ""
+        w = float(track_weights.get(tr, 0) or 0)
+        adj = _vec_sim(i) * (1.0 + w * 0.5)
+        scored.append((adj, doc))
+
+    scored.sort(key=lambda x: -x[0])
+    docs = [p[1] for p in scored[:TOP_K]]
 
     # 兜底：不够3篇则放宽引用限制
     if len(docs) < 3:
@@ -1299,10 +1346,9 @@ def main():
 
     def refresh_active_prompts():
         global active_system_prompt, active_intro_prompt
-        p = user_profile
-        cognitive_summary = user_mem.data.get("cognitive_summary", "")
-        if cognitive_summary:
-            p = user_profile + f"\n\n【用户近期认知状态】\n{cognitive_summary}"
+        p = build_system_prompt(
+            user_profile, user_mem.data.get("cognitive_summary", "")
+        )
         active_system_prompt = SYSTEM_PROMPT.replace("{user_profile}", p)
         active_intro_prompt = INTRO_SYSTEM_PROMPT.replace("{user_profile}", p)
 

@@ -9,6 +9,7 @@ import streamlit as st
 from cogsci_rag import (
     load_papers, build_or_load_vectorstore, get_embedder,
     hybrid_retrieve, ask_openrouter, build_user_profile,
+    build_system_prompt,
     SessionMemory, UserMemory,
     TRACK_NAMES, USER_PROFILE_QUESTIONS,
     SYSTEM_PROMPT, INTRO_SYSTEM_PROMPT,
@@ -205,10 +206,10 @@ if user_input:
     topic          = user_input[2:].strip() if (is_intro or is_concept_map or is_survey or is_hypothesis) else user_input
 
     # 构建带画像的prompt（每次从session state里取，含认知摘要）
-    base_profile = st.session_state.user_profile
-    cognitive_summary = st.session_state.user_memory.data.get("cognitive_summary", "")
-    if cognitive_summary:
-        base_profile = base_profile + f"\n\n【用户近期认知状态】\n{cognitive_summary}"
+    base_profile = build_system_prompt(
+        st.session_state.user_profile,
+        st.session_state.user_memory.data.get("cognitive_summary", ""),
+    )
 
     sys_qa    = SYSTEM_PROMPT.replace("{user_profile}", base_profile)
     sys_intro = INTRO_SYSTEM_PROMPT.replace("{user_profile}", base_profile)
