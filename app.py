@@ -3,10 +3,13 @@ CogSci RAG — Streamlit 界面
 运行：streamlit run app.py
 """
 
+from datetime import datetime
+
 import streamlit as st
 from cogsci_rag import (
     load_papers, build_or_load_vectorstore, get_embedder,
     hybrid_retrieve, ask_openrouter, build_user_profile,
+    SessionMemory, UserMemory,
     TRACK_NAMES, USER_PROFILE_QUESTIONS,
     SYSTEM_PROMPT, INTRO_SYSTEM_PROMPT,
 )
@@ -39,6 +42,12 @@ if "messages"       not in st.session_state:
     st.session_state.messages       = []   # {role, content, sources}
 if "profile_step"   not in st.session_state:
     st.session_state.profile_step   = 0
+if "user_memory"    not in st.session_state:
+    st.session_state.user_memory    = UserMemory()
+if "session_memory" not in st.session_state:
+    st.session_state.session_memory = SessionMemory(
+        datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
 
 # ── 侧边栏 ───────────────────────────────────────────────────────
 with st.sidebar:
@@ -62,9 +71,30 @@ with st.sidebar:
         st.markdown("### 使用方式")
         st.markdown("""
 - 直接输入问题 → 普通问答
-- 以 **`入门`** 开头 → 方向导览  
+        - 以 **`入门`** 开头 → 方向导览  
   例：`入门 预测编码`
         """)
+        st.divider()
+
+        st.markdown("### 对话记忆")
+        if st.session_state.session_memory.current_topics:
+            st.caption("当前话题")
+            for topic in st.session_state.session_memory.current_topics:
+                st.caption(f"· {topic}")
+        top_in = st.session_state.user_memory.get_top_interests(3)
+        if top_in:
+            st.caption("常问主题（本地累计）")
+            for interest in top_in:
+                cnt = st.session_state.user_memory.data["interests"]["topics"][
+                    interest
+                ].get("mentions", 0)
+                st.caption(f"· {interest}（{cnt}次）")
+        if st.button("清除本次对话记忆", use_container_width=True):
+            st.session_state.session_memory = SessionMemory(
+                datetime.now().strftime("%Y%m%d_%H%M%S")
+            )
+            st.session_state.messages = []
+            st.rerun()
         st.divider()
 
         # 重置按钮
@@ -73,6 +103,9 @@ with st.sidebar:
             st.session_state.answers      = {}
             st.session_state.profile_step = 0
             st.session_state.messages     = []
+            st.session_state.session_memory = SessionMemory(
+                datetime.now().strftime("%Y%m%d_%H%M%S")
+            )
             st.rerun()
 
 # ── 问卷界面 ─────────────────────────────────────────────────────
@@ -177,7 +210,12 @@ if user_input:
         cogsci_rag.active_intro_prompt  = sys_intro
 
         with st.spinner("生成回答..."):
-            answer = ask_openrouter(topic, docs, mode=mode)
+            answer = ask_openrouter(
+                topic,
+                docs,
+                mode=mode,
+                session_memory=st.session_state.session_memory,
+            )
 
         st.markdown(answer)
 
@@ -205,3 +243,6 @@ if user_input:
         "content": answer,
         "sources": docs,
     })
+
+    topics = st.session_state.session_memory.add_turn(user_input, answer, docs)
+    st.session_state.user_memory.record_turn_after(topics)

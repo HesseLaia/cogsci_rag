@@ -11,6 +11,7 @@ CogSci RAG 问答系统 v3
 import json
 import os
 import re
+from datetime import datetime
 import chromadb
 import requests
 from sentence_transformers import SentenceTransformer
@@ -203,6 +204,141 @@ def build_user_profile(answers: dict) -> str:
 在解释概念时，优先从{bg}的已知概念出发做类比，帮助用户建立连接而不是从零开始。"""
 
     return profile
+
+
+USER_MEMORY_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "user_memory.json"
+)
+
+
+class SessionMemory:
+    def __init__(self, session_id):
+        self.session_id = session_id
+        self.history = []
+        self.current_topics = []
+        self.max_history = 10
+
+    def add_turn(self, user_input, assistant_response, retrieved_docs):
+        topics = self._extract_topics(user_input)
+        for t in topics:
+            if t in self.current_topics:
+                self.current_topics.remove(t)
+            self.current_topics.append(t)
+        self.current_topics = self.current_topics[-5:]
+
+        turn = {
+            "turn": len(self.history) + 1,
+            "user": user_input,
+            "assistant_summary": self._summarize(assistant_response),
+            "retrieved_docs": [
+                (d.get("book_title") or d.get("title", ""))
+                for d in (retrieved_docs or [])
+            ],
+            "timestamp": datetime.now().isoformat(),
+        }
+        self.history.append(turn)
+        if len(self.history) > self.max_history:
+            self.history = self.history[-self.max_history :]
+        return topics
+
+    def get_recent_context(self, n=3):
+        if not self.history:
+            return ""
+        recent = self.history[-n:]
+        lines = []
+        for t in recent:
+            lines.append(
+                "第{}轮 - 用户：{}；摘要：{}".format(
+                    t["turn"], t["user"], t["assistant_summary"]
+                )
+            )
+        return "\n".join(lines)
+
+    def detect_follow_up(self, user_input):
+        follow_up_signals = [
+            "这个",
+            "详细",
+            "展开",
+            "继续",
+            "那么",
+            "那",
+            "它",
+            "刚才",
+            "上文",
+            "前面说的",
+        ]
+        return any(sig in user_input for sig in follow_up_signals)
+
+    def _extract_topics(self, text):
+        cogsci_terms = [
+            "预测编码",
+            "注意力",
+            "工作记忆",
+            "意识",
+            "镜像神经元",
+            "贝叶斯",
+            "自由能",
+            "神经网络",
+            "强化学习",
+            "情绪",
+            "双语",
+        ]
+        return [term for term in cogsci_terms if term in text]
+
+    def _summarize(self, response):
+        if len(response) < 150:
+            return response
+        lines = [ln for ln in response.strip().split("\n") if ln.strip()]
+        if len(lines) <= 2:
+            return response[:150] + "..."
+        for i, line in enumerate(lines):
+            if "**结论**" in line or "**展开**" in line:
+                if i + 1 < len(lines):
+                    return lines[i + 1][:150]
+        return lines[0][:150] + "..."
+
+
+class UserMemory:
+    def __init__(self, memory_file=None):
+        self.memory_file = memory_file or USER_MEMORY_PATH
+        self.data = self._load()
+
+    def _load(self):
+        if os.path.exists(self.memory_file):
+            with open(self.memory_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {
+            "interests": {"topics": {}},
+            "interaction_stats": {"total_questions": 0},
+        }
+
+    def save(self):
+        with open(self.memory_file, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=2)
+
+    def record_turn_after(self, topics):
+        stats = self.data.setdefault("interaction_stats", {})
+        stats["total_questions"] = stats.get("total_questions", 0) + 1
+        if topics:
+            today = datetime.now().strftime("%Y-%m-%d")
+            bucket = self.data.setdefault("interests", {}).setdefault("topics", {})
+            for topic in topics:
+                if topic not in bucket:
+                    bucket[topic] = {"mentions": 0, "last_asked": None}
+                bucket[topic]["mentions"] = bucket[topic].get("mentions", 0) + 1
+                bucket[topic]["last_asked"] = today
+        self.save()
+
+    def get_top_interests(self, n=5):
+        topics = self.data.get("interests", {}).get("topics", {})
+        if not topics:
+            return []
+        sorted_topics = sorted(
+            topics.items(),
+            key=lambda x: x[1].get("mentions", 0),
+            reverse=True,
+        )
+        return [t[0] for t in sorted_topics[:n]]
 
 
 def run_profile_questionnaire() -> str:
@@ -581,7 +717,7 @@ def _build_library_context(docs):
 
 
 # ── OpenRouter生成 ────────────────────────────────────────────────
-def ask_openrouter(question, docs, mode="qa"):
+def ask_openrouter(question, docs, mode="qa", session_memory=None):
     context = _build_library_context(docs)
 
     if mode == "intro":
@@ -598,7 +734,21 @@ def ask_openrouter(question, docs, mode="qa"):
             "实验与实证可依据论文。引用时请对应序号并写出具体文献做了什么。\n\n"
         )
 
-    full_user = f"{hybrid_hint}=== 知识库 ===\n{context}\n\n{user_msg}"
+    memory_block = ""
+    follow_hint = ""
+    if session_memory and session_memory.history:
+        if session_memory.detect_follow_up(question):
+            mc = session_memory.get_recent_context(3)
+            if mc:
+                memory_block = "=== 对话历史 ===\n" + mc + "\n\n"
+                follow_hint = (
+                    "【说明】用户这句话可能延续上一轮话题，请结合对话历史理解指代。\n\n"
+                )
+
+    full_user = (
+        f"{memory_block}{follow_hint}{hybrid_hint}"
+        f"=== 知识库 ===\n{context}\n\n{user_msg}"
+    )
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -679,6 +829,9 @@ def main():
     active_system_prompt = SYSTEM_PROMPT.replace("{user_profile}", user_profile)
     active_intro_prompt = INTRO_SYSTEM_PROMPT.replace("{user_profile}", user_profile)
 
+    session_mem = SessionMemory(datetime.now().strftime("%Y%m%d_%H%M%S"))
+    user_mem = UserMemory()
+
     while True:
         print()
         user_input = input("你：").strip()
@@ -709,7 +862,12 @@ def main():
             print_sources(docs)
             print("\n生成入门指南中...\n")
             print("─── 入门指南 ────────────────────────────────────────")
-            print(ask_openrouter(topic, docs, mode="intro"))
+            ans = ask_openrouter(
+                topic, docs, mode="intro", session_memory=session_mem
+            )
+            print(ans)
+            topics = session_mem.add_turn(user_input, ans, docs)
+            user_mem.record_turn_after(topics)
             print("─────────────────────────────────────────────────────")
 
         else:
@@ -718,7 +876,12 @@ def main():
             print_sources(docs)
             print("\n回答中...\n")
             print("─── 回答 ────────────────────────────────────────────")
-            print(ask_openrouter(user_input, docs, mode="qa"))
+            ans = ask_openrouter(
+                user_input, docs, mode="qa", session_memory=session_mem
+            )
+            print(ans)
+            topics = session_mem.add_turn(user_input, ans, docs)
+            user_mem.record_turn_after(topics)
             print("─────────────────────────────────────────────────────")
 
 

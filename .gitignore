@@ -39,3 +39,6 @@ Thumbs.db
 *_key.txt
 secrets.py
 .env
+
+# 本地对话长期记忆（个人偏好统计）
+user_memory.json
