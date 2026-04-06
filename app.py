@@ -71,8 +71,10 @@ with st.sidebar:
         st.markdown("### 使用方式")
         st.markdown("""
 - 直接输入问题 → 普通问答
-        - 以 **`入门`** 开头 → 方向导览  
+- 以 **`入门`** 开头 → 方向导览  
   例：`入门 预测编码`
+- 以 **`地图`** 开头 → 概念地图  
+  例：`地图 工作记忆`
         """)
         st.divider()
 
@@ -181,7 +183,7 @@ for msg in st.session_state.messages:
                     )
 
 # 输入框
-user_input = st.chat_input("问点什么，或者「入门 预测编码」...")
+user_input = st.chat_input("问点什么，或「入门」「地图」+主题...")
 
 if user_input:
     # 显示用户消息
@@ -190,8 +192,9 @@ if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input})
 
     # 判断模式
-    is_intro = user_input.startswith("入门")
-    topic    = user_input[2:].strip() if is_intro else user_input
+    is_intro       = user_input.startswith("入门")
+    is_concept_map = user_input.startswith("地图")
+    topic          = user_input[2:].strip() if (is_intro or is_concept_map) else user_input
 
     # 构建带画像的prompt（每次从session state里取）
     sys_qa    = SYSTEM_PROMPT.replace("{user_profile}", st.session_state.user_profile)
@@ -202,22 +205,67 @@ if user_input:
         with st.spinner("检索相关论文..."):
             docs = hybrid_retrieve(topic, collection)
 
-        mode = "intro" if is_intro else "qa"
+        if is_concept_map:
+            mode = "concept_map"
+        elif is_intro:
+            mode = "intro"
+        else:
+            mode = "qa"
 
-        # 临时替换全局prompt（ask_openrouter用的active_system_prompt）
-        import cogsci_rag
-        cogsci_rag.active_system_prompt = sys_qa
-        cogsci_rag.active_intro_prompt  = sys_intro
+        if mode == "concept_map":
+            from cogsci_rag import ask_concept_map
+            with st.spinner("生成概念地图..."):
+                result = ask_concept_map(topic, docs, st.session_state.user_profile)
 
-        with st.spinner("生成回答..."):
-            answer = ask_openrouter(
-                topic,
-                docs,
-                mode=mode,
-                session_memory=st.session_state.session_memory,
-            )
+            if "error" not in result:
+                st.markdown(f"### 核心定义\n{result.get('core', '')}")
+                st.divider()
 
-        st.markdown(answer)
+                st.markdown("### 相关概念")
+                related = result.get("related") or []
+                if related:
+                    cols = st.columns(min(len(related), 3))
+                    for i, rel in enumerate(related):
+                        if not isinstance(rel, dict):
+                            continue
+                        with cols[i % len(cols)]:
+                            st.info(
+                                f"**{rel.get('concept', '')}**\n\n{rel.get('relation', '')}"
+                            )
+                st.divider()
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("### 争议点")
+                    st.warning(result.get("debate", ""))
+                with col2:
+                    st.markdown("### 入门推荐")
+                    st.success(result.get("entry_point", ""))
+
+                st.divider()
+                st.markdown("### 代表人物")
+                kf = result.get("key_figures") or []
+                kf = [str(x) for x in kf if x is not None]
+                st.caption("、".join(kf) if kf else "—")
+
+                answer = f"概念地图已生成（{topic}）"
+            else:
+                st.error(f"生成失败：{result.get('error')}")
+                answer = result.get("raw", "生成失败")
+        else:
+            # 临时替换全局prompt（ask_openrouter用的active_system_prompt）
+            import cogsci_rag
+            cogsci_rag.active_system_prompt = sys_qa
+            cogsci_rag.active_intro_prompt  = sys_intro
+
+            with st.spinner("生成回答..."):
+                answer = ask_openrouter(
+                    topic,
+                    docs,
+                    mode=mode,
+                    session_memory=st.session_state.session_memory,
+                )
+
+            st.markdown(answer)
 
         # 来源折叠面板
         if docs:
