@@ -12,6 +12,8 @@ from cogsci_rag import (
     SessionMemory, UserMemory,
     TRACK_NAMES, USER_PROFILE_QUESTIONS,
     SYSTEM_PROMPT, INTRO_SYSTEM_PROMPT,
+    update_concept_understanding,
+    generate_cognitive_summary,
 )
 
 # ── 页面配置 ─────────────────────────────────────────────────────
@@ -202,9 +204,14 @@ if user_input:
     is_hypothesis  = user_input.startswith("假设")
     topic          = user_input[2:].strip() if (is_intro or is_concept_map or is_survey or is_hypothesis) else user_input
 
-    # 构建带画像的prompt（每次从session state里取）
-    sys_qa    = SYSTEM_PROMPT.replace("{user_profile}", st.session_state.user_profile)
-    sys_intro = INTRO_SYSTEM_PROMPT.replace("{user_profile}", st.session_state.user_profile)
+    # 构建带画像的prompt（每次从session state里取，含认知摘要）
+    base_profile = st.session_state.user_profile
+    cognitive_summary = st.session_state.user_memory.data.get("cognitive_summary", "")
+    if cognitive_summary:
+        base_profile = base_profile + f"\n\n【用户近期认知状态】\n{cognitive_summary}"
+
+    sys_qa    = SYSTEM_PROMPT.replace("{user_profile}", base_profile)
+    sys_intro = INTRO_SYSTEM_PROMPT.replace("{user_profile}", base_profile)
 
     # 检索 + 生成
     with st.chat_message("assistant"):
@@ -317,3 +324,5 @@ if user_input:
 
     topics = st.session_state.session_memory.add_turn(user_input, answer, docs)
     st.session_state.user_memory.record_turn_after(topics)
+    update_concept_understanding(user_input, answer, st.session_state.user_memory)
+    generate_cognitive_summary(st.session_state.user_memory)

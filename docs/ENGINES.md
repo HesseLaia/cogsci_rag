@@ -361,8 +361,411 @@ st.markdown("""
 
 ---
 
-## 方向三：用户认知建模（第二次迭代再讨论）
+## 方向三：用户认知建模
 目前已有用户画像问卷了，这是个很好的起点。往深了做可以记录用户问过什么、卡在哪里、对哪类解释反应好，动态更新画像，让引擎越用越懂这个人。本质上是在做一个关于"人如何学习和理解"的数据飞轮。
+
+### 核心思路
+
+现有 `user_memory.json` 是对话历史日志，记录"问了什么、回答了什么"，本质是计数器。
+
+**认知建模需要的是**：从日志提炼出结构化的用户认知状态
+- ❌ 不是"他问过预测编码"
+- ✅ 而是"他对预测编码的理解停留在直觉层面，对数学形式化还不适应，倾向于从神经科学角度类比"
+
+需要补齐两层能力：
+1. **理解深度标注**：从对话推断用户对每个概念的掌握程度
+2. **认知状态摘要**：周期性生成自然语言摘要，注入 system prompt
+
+---
+
+### 实现步骤
+
+#### 第一步：扩展 JSON 结构
+
+修改 `user_memory.json` 的数据结构，不改变现有的读写逻辑，只扩展字段。
+
+**新结构定义**：
+
+```json
+{
+  "interests": {
+    "topics": {
+      "预测编码": {
+        "mentions": 2,
+        "last_asked": "2026-04-06",
+        "understanding_level": "intuitive",
+        "preferred_angle": "神经科学",
+        "stuck_points": ["数学形式化"]
+      }
+    },
+    "track_weights": {
+      "cognitive_neuroscience": 0.4,
+      "philosophy": 0.3,
+      "cognitive_modeling_AI": 0.2,
+      "linguistics": 0.1
+    }
+  },
+  "cognitive_summary": "",
+  "interaction_stats": {
+    "total_questions": 11,
+    "last_summary_at": 0
+  }
+}
+```
+
+**字段说明**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `understanding_level` | string | 理解深度四档：`heard_of`（听说过）/ `intuitive`（直觉理解）/ `can_explain`（能解释）/ `critical`（批判性理解） |
+| `preferred_angle` | string | 用户倾向从哪个角度理解这个概念（如"神经科学"、"计算模型"、"哲学"） |
+| `stuck_points` | list | 用户明显回避或反复问的子问题（如"数学形式化"、"与XX的区别"） |
+| `track_weights` | dict | 动态更新的方向权重，反映真实兴趣比问卷更准 |
+| `cognitive_summary` | string | 每5次对话后自动生成的自然语言摘要，注入 system prompt |
+| `last_summary_at` | int | 上次生成摘要时的 `total_questions` 值 |
+
+**改动位置**：
+- 在 `cogsci_rag.py` 的 `UserMemory._load()` 中扩展默认值（第313-320行）
+- 保持现有读写逻辑不变，只修改初始化
+
+```python
+def _load(self):
+    if os.path.exists(self.memory_file):
+        with open(self.memory_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # 向后兼容：为已有数据补充缺失字段
+            if "cognitive_summary" not in data:
+                data["cognitive_summary"] = ""
+            if "interests" in data and "track_weights" not in data["interests"]:
+                data["interests"]["track_weights"] = {}
+            for topic, info in data.get("interests", {}).get("topics", {}).items():
+                if "understanding_level" not in info:
+                    info["understanding_level"] = "intuitive"
+                if "preferred_angle" not in info:
+                    info["preferred_angle"] = ""
+                if "stuck_points" not in info:
+                    info["stuck_points"] = []
+            if "last_summary_at" not in data.get("interaction_stats", {}):
+                data["interaction_stats"]["last_summary_at"] = 0
+            return data
+    return {
+        "interests": {"topics": {}, "track_weights": {}},
+        "cognitive_summary": "",
+        "interaction_stats": {"total_questions": 0, "last_summary_at": 0},
+    }
+```
+
+---
+
+#### 第二步：生成回答时顺手打标
+
+在 `ask_openrouter` 生成回答之后，新增一个 `update_concept_understanding()` 函数，用独立的 API 调用让模型分析这次对话。
+
+**函数定义**（放在 `UserMemory` 类之后）：
+
+```python
+CONCEPT_ANALYSIS_PROMPT = """分析这次对话，判断用户对主要概念的理解状态。
+
+【输出要求】
+返回严格的 JSON 格式，不要额外文字：
+{{
+  "concept": "主要涉及的概念名（中文，不超过10字）",
+  "understanding_level": "heard_of或intuitive或can_explain或critical",
+  "preferred_angle": "用户倾向的角度（如神经科学/计算模型/哲学/语言学，可为空）",
+  "stuck_points": ["用户明显不理解或回避的子问题，没有则为空数组"]
+}}
+
+【判断标准】
+- heard_of: 初次接触，问"是什么"
+- intuitive: 能理解类比，但问不出深层问题
+- can_explain: 能提出机制性问题，追问细节
+- critical: 质疑理论、比较不同观点
+
+【对话内容】
+用户问题：{user_question}
+助手回答：{assistant_answer}"""
+
+
+def update_concept_understanding(user_question, assistant_answer, user_memory):
+    """
+    异步分析对话，更新概念理解状态
+    调用失败时静默跳过，不影响主流程
+    """
+    prompt = CONCEPT_ANALYSIS_PROMPT.format(
+        user_question=user_question[:200],
+        assistant_answer=assistant_answer[:500]
+    )
+    
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://cogsci-rag.local",
+        "X-Title": "CogSci RAG"
+    }
+    body = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": prompt}
+        ],
+        "temperature": 0,
+        "max_tokens": 200
+    }
+    
+    try:
+        proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=body,
+                             timeout=30, proxies=proxies, verify=False)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        
+        # 解析 JSON
+        result = json.loads(content)
+        concept = result.get("concept", "")
+        if not concept:
+            return
+        
+        # 更新 user_memory
+        topics = user_memory.data.setdefault("interests", {}).setdefault("topics", {})
+        if concept not in topics:
+            topics[concept] = {
+                "mentions": 1,
+                "last_asked": datetime.now().strftime("%Y-%m-%d"),
+                "understanding_level": "intuitive",
+                "preferred_angle": "",
+                "stuck_points": []
+            }
+        
+        # 更新字段
+        topics[concept]["understanding_level"] = result.get("understanding_level", "intuitive")
+        angle = result.get("preferred_angle", "")
+        if angle:
+            topics[concept]["preferred_angle"] = angle
+        
+        stuck = result.get("stuck_points", [])
+        if stuck:
+            existing = set(topics[concept].get("stuck_points", []))
+            existing.update(stuck)
+            topics[concept]["stuck_points"] = list(existing)[:5]  # 最多保留5个
+        
+        user_memory.save()
+    
+    except Exception as e:
+        # 静默失败，不影响主流程
+        pass
+```
+
+**调用位置**：
+- 在 `main()` 的回答生成后（第891行附近）
+- 在 `app.py` 的回答生成后（第247行附近）
+
+```python
+# main() 中（第891行附近）
+ans = ask_openrouter(user_input, docs, mode="qa", session_memory=session_mem)
+print(ans)
+topics = session_mem.add_turn(user_input, ans, docs)
+user_mem.record_turn_after(topics)
+
+# 新增：异步分析概念理解状态
+update_concept_understanding(user_input, ans, user_mem)  # 新增这一行
+```
+
+```python
+# app.py 中（第247行附近）
+topics = st.session_state.session_memory.add_turn(user_input, answer, docs)
+st.session_state.user_memory.record_turn_after(topics)
+
+# 新增：异步分析概念理解状态
+from cogsci_rag import update_concept_understanding
+update_concept_understanding(user_input, answer, st.session_state.user_memory)  # 新增这一行
+```
+
+---
+
+#### 第三步：认知摘要生成与注入
+
+新增 `generate_cognitive_summary()` 函数，触发条件：`total_questions` 是 5 的倍数，且比 `last_summary_at` 大。
+
+**函数定义**（放在 `update_concept_understanding` 之后）：
+
+```python
+COGNITIVE_SUMMARY_PROMPT = """基于用户的对话历史数据，生成一段认知状态摘要。
+
+【输出要求】
+- 不超过150字的中文
+- 格式："用户对X理解较深，倾向从Y角度切入；对Z概念有兴趣但停留在直觉层；最近频繁问A类问题，可以适当深入B方向"
+- 突出理解深度差异、卡点、倾向的角度
+
+【用户数据】
+{user_data}"""
+
+
+def generate_cognitive_summary(user_memory):
+    """
+    每5次对话后生成认知状态摘要
+    触发条件：total_questions % 5 == 0 且 > last_summary_at
+    """
+    stats = user_memory.data.get("interaction_stats", {})
+    total = stats.get("total_questions", 0)
+    last_gen = stats.get("last_summary_at", 0)
+    
+    # 检查触发条件
+    if total % 5 != 0 or total <= last_gen:
+        return
+    
+    # 整理用户数据
+    topics = user_memory.data.get("interests", {}).get("topics", {})
+    if not topics:
+        return
+    
+    # 按理解深度分组
+    level_map = {"heard_of": "初识", "intuitive": "直觉", "can_explain": "能解释", "critical": "批判性"}
+    topic_lines = []
+    for concept, info in sorted(topics.items(), key=lambda x: x[1].get("mentions", 0), reverse=True)[:8]:
+        level = level_map.get(info.get("understanding_level", "intuitive"), "直觉")
+        angle = info.get("preferred_angle", "")
+        stuck = info.get("stuck_points", [])
+        line = f"- {concept}（{level}层，{info.get('mentions', 0)}次）"
+        if angle:
+            line += f"，倾向{angle}角度"
+        if stuck:
+            line += f"，卡点：{'、'.join(stuck[:2])}"
+        topic_lines.append(line)
+    
+    user_data_text = "\n".join(topic_lines)
+    
+    # 调用模型生成摘要
+    prompt = COGNITIVE_SUMMARY_PROMPT.format(user_data=user_data_text)
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://cogsci-rag.local",
+        "X-Title": "CogSci RAG"
+    }
+    body = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": prompt}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 300
+    }
+    
+    try:
+        proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=body,
+                             timeout=30, proxies=proxies, verify=False)
+        resp.raise_for_status()
+        summary = resp.json()["choices"][0]["message"]["content"].strip()
+        
+        # 写入 user_memory
+        user_memory.data["cognitive_summary"] = summary
+        user_memory.data["interaction_stats"]["last_summary_at"] = total
+        user_memory.save()
+    
+    except Exception as e:
+        # 静默失败
+        pass
+```
+
+**注入 System Prompt**：
+
+修改 `main()` 和 `app.py` 中构建 system prompt 的逻辑：
+
+```python
+# main() 中（第836行附近）
+user_profile = run_profile_questionnaire()
+
+# 新增：注入认知摘要
+cognitive_summary = user_mem.data.get("cognitive_summary", "")
+if cognitive_summary:
+    user_profile += f"\n\n【用户近期认知状态】\n{cognitive_summary}"
+
+active_system_prompt = SYSTEM_PROMPT.replace("{user_profile}", user_profile)
+active_intro_prompt = INTRO_SYSTEM_PROMPT.replace("{user_profile}", user_profile)
+```
+
+```python
+# app.py 中（第197-198行附近）
+sys_qa = SYSTEM_PROMPT.replace("{user_profile}", st.session_state.user_profile)
+sys_intro = INTRO_SYSTEM_PROMPT.replace("{user_profile}", st.session_state.user_profile)
+
+# 改为：
+base_profile = st.session_state.user_profile
+cognitive_summary = st.session_state.user_memory.data.get("cognitive_summary", "")
+if cognitive_summary:
+    base_profile += f"\n\n【用户近期认知状态】\n{cognitive_summary}"
+
+sys_qa = SYSTEM_PROMPT.replace("{user_profile}", base_profile)
+sys_intro = INTRO_SYSTEM_PROMPT.replace("{user_profile}", base_profile)
+```
+
+**调用时机**：
+
+```python
+# main() 中（第891行后）
+topics = session_mem.add_turn(user_input, ans, docs)
+user_mem.record_turn_after(topics)
+update_concept_understanding(user_input, ans, user_mem)
+generate_cognitive_summary(user_mem)  # 新增：检查是否需要生成摘要
+```
+
+```python
+# app.py 中（第247行后）
+topics = st.session_state.session_memory.add_turn(user_input, answer, docs)
+st.session_state.user_memory.record_turn_after(topics)
+update_concept_understanding(user_input, answer, st.session_state.user_memory)
+from cogsci_rag import generate_cognitive_summary
+generate_cognitive_summary(st.session_state.user_memory)  # 新增
+```
+
+---
+
+### 改动清单
+
+| 位置 | 改动内容 | 说明 |
+|------|---------|------|
+| `UserMemory._load()` | 扩展 JSON 结构初始化 | 向后兼容，为旧数据补充缺失字段 |
+| `UserMemory` 类后 | 新增 `CONCEPT_ANALYSIS_PROMPT` 常量 | 概念理解分析 prompt |
+| `UserMemory` 类后 | 新增 `update_concept_understanding()` 函数 | 异步分析对话，更新理解状态 |
+| `update_concept_understanding` 后 | 新增 `COGNITIVE_SUMMARY_PROMPT` 常量 | 认知摘要生成 prompt |
+| `update_concept_understanding` 后 | 新增 `generate_cognitive_summary()` 函数 | 每5次对话生成摘要 |
+| `main()` 第836行 | 注入认知摘要到 system prompt | 扩展用户画像 |
+| `main()` 第891行 | 调用两个新函数 | 打标 + 摘要 |
+| `app.py` 第197行 | 注入认知摘要到 system prompt | 扩展用户画像 |
+| `app.py` 第247行 | 调用两个新函数 | 打标 + 摘要 |
+
+---
+
+### 核心设计原则
+
+✅ **非阻塞**：理解状态分析和摘要生成都在回答返回后异步执行，不影响用户体验
+
+✅ **静默失败**：API 调用失败时不报错，不影响主流程
+
+✅ **向后兼容**：旧 `user_memory.json` 数据自动补充缺失字段，不需要手动迁移
+
+✅ **渐进增强**：
+- 前5次对话：仅累计数据
+- 第5次对话后：开始注入认知摘要到 system prompt
+- 持续对话：每5次更新一次摘要，让 AI 越来越懂用户
+
+---
+
+### 预期效果
+
+**初次使用**（第1-4次对话）：
+- 系统仅依赖问卷画像
+- 后台默默记录概念理解状态
+
+**第5次对话后**：
+- 生成第一份认知摘要，例如：  
+  _"用户对预测编码有兴趣但停留在直觉层，倾向从神经科学角度类比；对自由能原理频繁提问，可适当深入贝叶斯推断基础；对数学形式化有回避倾向"_
+- 此后所有回答都基于这份动态画像，自动调整解释策略
+
+**长期使用**：
+- 画像越来越精准，反映真实学习轨迹
+- 可基于 `stuck_points` 主动推荐针对性内容
+- 可基于 `understanding_level` 自动调整解释深度
 
 ---
 

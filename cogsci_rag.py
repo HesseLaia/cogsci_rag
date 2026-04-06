@@ -380,10 +380,25 @@ class UserMemory:
     def _load(self):
         if os.path.exists(self.memory_file):
             with open(self.memory_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                if "cognitive_summary" not in data:
+                    data["cognitive_summary"] = ""
+                if "interests" in data and "track_weights" not in data["interests"]:
+                    data["interests"]["track_weights"] = {}
+                for topic, info in data.get("interests", {}).get("topics", {}).items():
+                    if "understanding_level" not in info:
+                        info["understanding_level"] = "intuitive"
+                    if "preferred_angle" not in info:
+                        info["preferred_angle"] = ""
+                    if "stuck_points" not in info:
+                        info["stuck_points"] = []
+                if "last_summary_at" not in data.get("interaction_stats", {}):
+                    data.setdefault("interaction_stats", {})["last_summary_at"] = 0
+                return data
         return {
-            "interests": {"topics": {}},
-            "interaction_stats": {"total_questions": 0},
+            "interests": {"topics": {}, "track_weights": {}},
+            "cognitive_summary": "",
+            "interaction_stats": {"total_questions": 0, "last_summary_at": 0},
         }
 
     def save(self):
@@ -413,6 +428,165 @@ class UserMemory:
             reverse=True,
         )
         return [t[0] for t in sorted_topics[:n]]
+
+
+CONCEPT_ANALYSIS_PROMPT = """分析这次对话，判断用户对主要概念的理解状态。
+
+【输出要求】
+返回严格的 JSON 格式，不要额外文字：
+{{
+  "concept": "主要涉及的概念名（中文，不超过10字）",
+  "understanding_level": "heard_of或intuitive或can_explain或critical",
+  "preferred_angle": "用户倾向的角度（如神经科学/计算模型/哲学/语言学，可为空）",
+  "stuck_points": ["用户明显不理解或回避的子问题，没有则为空数组"]
+}}
+
+【判断标准】
+- heard_of: 初次接触，问"是什么"
+- intuitive: 能理解类比，但问不出深层问题
+- can_explain: 能提出机制性问题，追问细节
+- critical: 质疑理论、比较不同观点
+
+【对话内容】
+用户问题：{user_question}
+助手回答：{assistant_answer}"""
+
+
+def update_concept_understanding(user_question, assistant_answer, user_memory):
+    """
+    异步分析对话，更新概念理解状态
+    调用失败时静默跳过，不影响主流程
+    """
+    prompt = CONCEPT_ANALYSIS_PROMPT.format(
+        user_question=user_question[:200],
+        assistant_answer=assistant_answer[:500]
+    )
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://cogsci-rag.local",
+        "X-Title": "CogSci RAG"
+    }
+    body = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": prompt}
+        ],
+        "temperature": 0,
+        "max_tokens": 200
+    }
+
+    try:
+        proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=body,
+                             timeout=30, proxies=proxies, verify=False)
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+
+        result = json.loads(content)
+        concept = result.get("concept", "")
+        if not concept:
+            return
+
+        topics = user_memory.data.setdefault("interests", {}).setdefault("topics", {})
+        if concept not in topics:
+            topics[concept] = {
+                "mentions": 1,
+                "last_asked": datetime.now().strftime("%Y-%m-%d"),
+                "understanding_level": "intuitive",
+                "preferred_angle": "",
+                "stuck_points": []
+            }
+
+        topics[concept]["understanding_level"] = result.get("understanding_level", "intuitive")
+        angle = result.get("preferred_angle", "")
+        if angle:
+            topics[concept]["preferred_angle"] = angle
+
+        stuck = result.get("stuck_points", [])
+        if stuck:
+            existing = set(topics[concept].get("stuck_points", []))
+            existing.update(stuck)
+            topics[concept]["stuck_points"] = list(existing)[:5]
+
+        user_memory.save()
+
+    except Exception:
+        pass
+
+
+COGNITIVE_SUMMARY_PROMPT = """基于用户的对话历史数据，生成一段认知状态摘要。
+
+【输出要求】
+- 不超过150字的中文
+- 格式："用户对X理解较深，倾向从Y角度切入；对Z概念有兴趣但停留在直觉层；最近频繁问A类问题，可以适当深入B方向"
+- 突出理解深度差异、卡点、倾向的角度
+
+【用户数据】
+{user_data}"""
+
+
+def generate_cognitive_summary(user_memory):
+    """
+    每5次对话后生成认知状态摘要
+    触发条件：total_questions % 5 == 0 且 > last_summary_at
+    """
+    stats = user_memory.data.get("interaction_stats", {})
+    total = stats.get("total_questions", 0)
+    last_gen = stats.get("last_summary_at", 0)
+
+    if total % 5 != 0 or total <= last_gen:
+        return
+
+    topics = user_memory.data.get("interests", {}).get("topics", {})
+    if not topics:
+        return
+
+    level_map = {"heard_of": "初识", "intuitive": "直觉", "can_explain": "能解释", "critical": "批判性"}
+    topic_lines = []
+    for concept, info in sorted(topics.items(), key=lambda x: x[1].get("mentions", 0), reverse=True)[:8]:
+        level = level_map.get(info.get("understanding_level", "intuitive"), "直觉")
+        angle = info.get("preferred_angle", "")
+        stuck = info.get("stuck_points", [])
+        line = f"- {concept}（{level}层，{info.get('mentions', 0)}次）"
+        if angle:
+            line += f"，倾向{angle}角度"
+        if stuck:
+            line += f"，卡点：{'、'.join(stuck[:2])}"
+        topic_lines.append(line)
+
+    user_data_text = "\n".join(topic_lines)
+
+    prompt = COGNITIVE_SUMMARY_PROMPT.format(user_data=user_data_text)
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://cogsci-rag.local",
+        "X-Title": "CogSci RAG"
+    }
+    body = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": prompt}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 300
+    }
+
+    try:
+        proxies = {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+        resp = requests.post(OPENROUTER_URL, headers=headers, json=body,
+                             timeout=30, proxies=proxies, verify=False)
+        resp.raise_for_status()
+        summary = resp.json()["choices"][0]["message"]["content"].strip()
+
+        user_memory.data["cognitive_summary"] = summary
+        user_memory.data["interaction_stats"]["last_summary_at"] = total
+        user_memory.save()
+
+    except Exception:
+        pass
 
 
 def run_profile_questionnaire() -> str:
@@ -1046,12 +1220,22 @@ def main():
 
     user_profile = run_profile_questionnaire()
 
+    user_mem = UserMemory()
+
     global active_system_prompt, active_intro_prompt
-    active_system_prompt = SYSTEM_PROMPT.replace("{user_profile}", user_profile)
-    active_intro_prompt = INTRO_SYSTEM_PROMPT.replace("{user_profile}", user_profile)
+
+    def refresh_active_prompts():
+        global active_system_prompt, active_intro_prompt
+        p = user_profile
+        cognitive_summary = user_mem.data.get("cognitive_summary", "")
+        if cognitive_summary:
+            p = user_profile + f"\n\n【用户近期认知状态】\n{cognitive_summary}"
+        active_system_prompt = SYSTEM_PROMPT.replace("{user_profile}", p)
+        active_intro_prompt = INTRO_SYSTEM_PROMPT.replace("{user_profile}", p)
+
+    refresh_active_prompts()
 
     session_mem = SessionMemory(datetime.now().strftime("%Y%m%d_%H%M%S"))
-    user_mem = UserMemory()
 
     while True:
         print()
@@ -1083,12 +1267,15 @@ def main():
             print_sources(docs)
             print("\n生成入门指南中...\n")
             print("─── 入门指南 ────────────────────────────────────────")
+            refresh_active_prompts()
             ans = ask_openrouter(
                 topic, docs, mode="intro", session_memory=session_mem
             )
             print(ans)
             topics = session_mem.add_turn(user_input, ans, docs)
             user_mem.record_turn_after(topics)
+            update_concept_understanding(user_input, ans, user_mem)
+            generate_cognitive_summary(user_mem)
             print("─────────────────────────────────────────────────────")
 
         else:
@@ -1097,12 +1284,15 @@ def main():
             print_sources(docs)
             print("\n回答中...\n")
             print("─── 回答 ────────────────────────────────────────────")
+            refresh_active_prompts()
             ans = ask_openrouter(
                 user_input, docs, mode="qa", session_memory=session_mem
             )
             print(ans)
             topics = session_mem.add_turn(user_input, ans, docs)
             user_mem.record_turn_after(topics)
+            update_concept_understanding(user_input, ans, user_mem)
+            generate_cognitive_summary(user_mem)
             print("─────────────────────────────────────────────────────")
 
 
