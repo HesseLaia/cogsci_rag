@@ -323,6 +323,14 @@ if user_input:
     })
 
     topics = st.session_state.session_memory.add_turn(user_input, answer, docs)
-    st.session_state.user_memory.record_turn_after(topics)
-    update_concept_understanding(user_input, answer, st.session_state.user_memory)
+    st.session_state.user_memory.record_turn_after(
+        topics,
+        docs,
+        st.session_state.answers.get("interest"),
+    )
+    update_concept_understanding(
+        user_input,
+        st.session_state.user_memory,
+        st.session_state.user_profile,
+    )
     generate_cognitive_summary(st.session_state.user_memory)

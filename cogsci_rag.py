@@ -9,6 +9,7 @@ CogSci RAG 问答系统 v3
 """
 
 import json
+import logging
 import os
 import re
 from datetime import datetime
@@ -46,6 +47,46 @@ TRACK_NAMES = {
     "linguistics":            "语言学",
     "philosophy":             "心智哲学",
 }
+
+INTEREST_LETTER_TO_TRACK = {
+    "A": "philosophy",
+    "B": "cognitive_neuroscience",
+    "C": "cognitive_modeling_AI",
+    "D": "linguistics",
+    "E": "social_sciences",
+}
+
+
+def _normalize_track_weights(weights):
+    s = sum(weights.values())
+    if s <= 0:
+        return
+    for k in list(weights.keys()):
+        weights[k] = weights[k] / s
+
+
+def _init_track_weights_from_questionnaire(weights, interest_letters):
+    if not interest_letters:
+        return
+    for c in str(interest_letters).strip().upper():
+        tr = INTEREST_LETTER_TO_TRACK.get(c)
+        if tr:
+            weights[tr] = weights.get(tr, 0) + 1.0
+    if weights:
+        _normalize_track_weights(weights)
+
+
+def _update_track_weights_from_docs(weights, retrieved_docs):
+    for d in retrieved_docs or []:
+        tr = (d.get("track") or "").strip()
+        if not tr:
+            continue
+        if tr not in weights:
+            weights[tr] = 0.1
+        weights[tr] += 0.1
+    if weights:
+        _normalize_track_weights(weights)
+
 
 SYSTEM_PROMPT = """你是一位认知科学领域的学者，正在帮一位朋友学习认知科学。
 
@@ -405,7 +446,7 @@ class UserMemory:
         with open(self.memory_file, "w", encoding="utf-8") as f:
             json.dump(self.data, f, ensure_ascii=False, indent=2)
 
-    def record_turn_after(self, topics):
+    def record_turn_after(self, topics, retrieved_docs=None, interest_letters=None):
         stats = self.data.setdefault("interaction_stats", {})
         stats["total_questions"] = stats.get("total_questions", 0) + 1
         if topics:
@@ -416,6 +457,11 @@ class UserMemory:
                     bucket[topic] = {"mentions": 0, "last_asked": None}
                 bucket[topic]["mentions"] = bucket[topic].get("mentions", 0) + 1
                 bucket[topic]["last_asked"] = today
+        interests = self.data.setdefault("interests", {})
+        weights = interests.setdefault("track_weights", {})
+        if not weights and interest_letters:
+            _init_track_weights_from_questionnaire(weights, interest_letters)
+        _update_track_weights_from_docs(weights, retrieved_docs)
         self.save()
 
     def get_top_interests(self, n=5):
@@ -430,36 +476,34 @@ class UserMemory:
         return [t[0] for t in sorted_topics[:n]]
 
 
-CONCEPT_ANALYSIS_PROMPT = """分析这次对话，判断用户对主要概念的理解状态。
+CONCEPT_ANALYSIS_PROMPT = """分析以下对话，提取用户的认知状态。
+用户问题：__QUESTION__
+用户背景：__PROFILE__
 
-【输出要求】
-返回严格的 JSON 格式，不要额外文字：
-{{
-  "concept": "主要涉及的概念名（中文，不超过10字）",
-  "understanding_level": "heard_of或intuitive或can_explain或critical",
-  "preferred_angle": "用户倾向的角度（如神经科学/计算模型/哲学/语言学，可为空）",
-  "stuck_points": ["用户明显不理解或回避的子问题，没有则为空数组"]
-}}
+只输出JSON，不要任何其他文字：
+{
+  "concept": "本次对话最核心的一个概念（中文，2-6字）",
+  "understanding_level": "heard_of或intuitive或can_explain或critical之一",
+  "preferred_angle": "用户用来理解这个概念的类比来源领域，如心理学/神经科学/哲学/计算机，没有明显倾向则填空字符串",
+  "stuck_points": ["用户明显困惑或回避的子问题，没有则返回空数组"]
+}
 
-【判断标准】
-- heard_of: 初次接触，问"是什么"
-- intuitive: 能理解类比，但问不出深层问题
-- can_explain: 能提出机制性问题，追问细节
-- critical: 质疑理论、比较不同观点
-
-【对话内容】
-用户问题：{user_question}
-助手回答：{assistant_answer}"""
+判断标准：
+- heard_of：只是提到，没有展开追问
+- intuitive：能用自己的话描述，但依赖类比
+- can_explain：能问出机制层面的问题
+- critical：能指出局限或提出反例"""
 
 
-def update_concept_understanding(user_question, assistant_answer, user_memory):
+def update_concept_understanding(user_question, user_memory, user_profile_brief=""):
     """
-    异步分析对话，更新概念理解状态
-    调用失败时静默跳过，不影响主流程
+    分析用户问题与背景，更新概念理解状态。
+    JSON 解析失败时会在控制台打印模型原始输出；其它异常仍静默跳过。
     """
-    prompt = CONCEPT_ANALYSIS_PROMPT.format(
-        user_question=user_question[:200],
-        assistant_answer=assistant_answer[:500]
+    q = (user_question or "")[:200]
+    pb = (user_profile_brief or "")[:800]
+    prompt = (
+        CONCEPT_ANALYSIS_PROMPT.replace("__QUESTION__", q).replace("__PROFILE__", pb)
     )
 
     headers = {
@@ -484,7 +528,13 @@ def update_concept_understanding(user_question, assistant_answer, user_memory):
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"]
 
-        result = json.loads(content)
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError:
+            print("[update_concept_understanding] JSON 解析失败，模型原始输出：")
+            print(content)
+            return
+
         concept = result.get("concept", "")
         if not concept:
             return
@@ -514,6 +564,21 @@ def update_concept_understanding(user_question, assistant_answer, user_memory):
 
     except Exception:
         pass
+
+
+def _clean_cognitive_summary_output(raw):
+    s = raw
+    while True:
+        s = s.strip()
+        if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+            s = s[1:-1]
+            continue
+        if len(s) >= 4 and s.startswith('\\"') and s.endswith('\\"'):
+            s = s[2:-2]
+            continue
+        break
+    s = re.sub(r'（[^）]*字[^）]*）', '', s)
+    return s.strip()
 
 
 COGNITIVE_SUMMARY_PROMPT = """基于用户的对话历史数据，生成一段认知状态摘要。
@@ -579,7 +644,15 @@ def generate_cognitive_summary(user_memory):
         resp = requests.post(OPENROUTER_URL, headers=headers, json=body,
                              timeout=30, proxies=proxies, verify=False)
         resp.raise_for_status()
-        summary = resp.json()["choices"][0]["message"]["content"].strip()
+        summary = _clean_cognitive_summary_output(
+            resp.json()["choices"][0]["message"]["content"]
+        )
+        n = len(summary)
+        if n < 20 or n > 200:
+            logging.warning(
+                "cognitive_summary 清洗后长度为 %d，不在 20–200 建议范围内，仍写入",
+                n,
+            )
 
         user_memory.data["cognitive_summary"] = summary
         user_memory.data["interaction_stats"]["last_summary_at"] = total
@@ -1273,8 +1346,8 @@ def main():
             )
             print(ans)
             topics = session_mem.add_turn(user_input, ans, docs)
-            user_mem.record_turn_after(topics)
-            update_concept_understanding(user_input, ans, user_mem)
+            user_mem.record_turn_after(topics, docs)
+            update_concept_understanding(user_input, user_mem, user_profile)
             generate_cognitive_summary(user_mem)
             print("─────────────────────────────────────────────────────")
 
@@ -1290,8 +1363,8 @@ def main():
             )
             print(ans)
             topics = session_mem.add_turn(user_input, ans, docs)
-            user_mem.record_turn_after(topics)
-            update_concept_understanding(user_input, ans, user_mem)
+            user_mem.record_turn_after(topics, docs)
+            update_concept_understanding(user_input, user_mem, user_profile)
             generate_cognitive_summary(user_mem)
             print("─────────────────────────────────────────────────────")
 
