@@ -75,6 +75,10 @@ with st.sidebar:
   例：`入门 预测编码`
 - 以 **`地图`** 开头 → 概念地图  
   例：`地图 工作记忆`
+- 以 **`综述`** 开头 → 文献综述  
+  例：`综述 注意力机制`
+- 以 **`假设`** 开头 → 研究假设生成  
+  例：`假设 双语者工作记忆优势`
         """)
         st.divider()
 
@@ -183,7 +187,7 @@ for msg in st.session_state.messages:
                     )
 
 # 输入框
-user_input = st.chat_input("问点什么，或「入门」「地图」+主题...")
+user_input = st.chat_input("问点什么，或「入门」「地图」「综述」「假设」+主题...")
 
 if user_input:
     # 显示用户消息
@@ -194,7 +198,9 @@ if user_input:
     # 判断模式
     is_intro       = user_input.startswith("入门")
     is_concept_map = user_input.startswith("地图")
-    topic          = user_input[2:].strip() if (is_intro or is_concept_map) else user_input
+    is_survey      = user_input.startswith("综述")
+    is_hypothesis  = user_input.startswith("假设")
+    topic          = user_input[2:].strip() if (is_intro or is_concept_map or is_survey or is_hypothesis) else user_input
 
     # 构建带画像的prompt（每次从session state里取）
     sys_qa    = SYSTEM_PROMPT.replace("{user_profile}", st.session_state.user_profile)
@@ -207,10 +213,16 @@ if user_input:
 
         if is_concept_map:
             mode = "concept_map"
+        elif is_survey:
+            mode = "survey"
+        elif is_hypothesis:
+            mode = "hypothesis"
         elif is_intro:
             mode = "intro"
         else:
             mode = "qa"
+
+        expanded_sources = (mode == "hypothesis")
 
         if mode == "concept_map":
             from cogsci_rag import ask_concept_map
@@ -251,6 +263,17 @@ if user_input:
             else:
                 st.error(f"生成失败：{result.get('error')}")
                 answer = result.get("raw", "生成失败")
+        elif mode == "survey":
+            from cogsci_rag import ask_survey
+            st.warning("⚠️ 综述基于知识库现有文献，不保证覆盖最新进展")
+            with st.spinner("生成综述中（检索扩展到12篇）..."):
+                answer, docs = ask_survey(topic, docs, st.session_state.user_profile)
+            st.markdown(answer)
+        elif mode == "hypothesis":
+            from cogsci_rag import ask_hypothesis
+            with st.spinner("生成研究假设..."):
+                answer = ask_hypothesis(topic, docs, st.session_state.user_profile)
+            st.markdown(answer)
         else:
             # 临时替换全局prompt（ask_openrouter用的active_system_prompt）
             import cogsci_rag
@@ -269,7 +292,7 @@ if user_input:
 
         # 来源折叠面板
         if docs:
-            with st.expander("📄 检索到的来源", expanded=False):
+            with st.expander("📄 检索到的来源", expanded=expanded_sources):
                 for i, d in enumerate(docs, 1):
                     track_cn = TRACK_NAMES.get(d["track"], d["track"])
                     cite_str = f" · {d['citations']}次引用" if d.get("citations") else ""
