@@ -16,6 +16,13 @@ import chromadb
 import requests
 from sentence_transformers import SentenceTransformer
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+else:
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 # ── 配置 ─────────────────────────────────────────────────────────
 PAPERS_PATH = "data/all_papers_fulltext.json"
 CHROMA_DIR        = "chroma_db"
@@ -23,8 +30,8 @@ COLLECTION        = "cogsci_papers"
 EMBED_MODEL       = "all-MiniLM-L6-v2"
 OLLAMA_URL        = "http://localhost:11434/api/generate"
 
-# 从环境变量读取 OpenRouter API Key，避免硬编码到仓库
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+# 从环境变量读取 OpenRouter API Key（含从项目根 .env 自动加载，需安装 python-dotenv）
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip().strip('"').strip("'")
 OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
 OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
 
